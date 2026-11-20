@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -207,7 +208,6 @@ class TestEndToEndDaemon(unittest.TestCase):
                     "llama_server_url": url,
                     "require_localhost": True,
                     "canary_slot_id": 0,
-                    "require_adapter_file": False,
                     "canary_suite_path": str(CANARY_SUITE_PATH),
                     "ledger_path": str(ledger_path),
                     "ledger_key_path": str(key_file),
@@ -250,7 +250,18 @@ class TestEndToEndDaemon(unittest.TestCase):
                     st = rpc.call("wmcp_slot_status")
                     self.assertEqual(st["result"]["active_adapters"], [])
 
-                    mnt = rpc.call("wmcp_slot_mount", {"bundles": [make_adapter_bundle_dict()]})
+                    # The daemon config omits require_adapter_file, so the default must refuse
+                    # a bundle whose adapter file was never hashed.
+                    unhashed = rpc.call("wmcp_slot_mount", {"bundles": [make_adapter_bundle_dict()]})
+                    self.assertEqual(unhashed["error"]["data"]["code"], "ERR_CHECKPOINT_MISMATCH")
+
+                    adapter_file = tmp / "adapter.gguf"
+                    adapter_file.write_bytes(b"subprocess-adapter-bytes")
+                    hashed = make_adapter_bundle_dict(
+                        adapter_path=str(adapter_file),
+                        adapter_sha256=hashlib.sha256(b"subprocess-adapter-bytes").hexdigest(),
+                    )
+                    mnt = rpc.call("wmcp_slot_mount", {"bundles": [hashed]})
                     self.assertEqual(len(mnt["result"]["active_adapters"]), 1)
 
                     unm = rpc.call("wmcp_slot_unmount", {"reason": "subproc_test_done"})
@@ -288,7 +299,8 @@ class TestEndToEndDaemon(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(verify_res.returncode, 0, msg=verify_res.stderr)
-                self.assertEqual(json.loads(verify_res.stdout)["receipts_verified"], 2)
+                # reject (unhashed bundle), mount, unmount
+                self.assertEqual(json.loads(verify_res.stdout)["receipts_verified"], 3)
         finally:
             mock.stop()
 
