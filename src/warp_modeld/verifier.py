@@ -17,6 +17,7 @@ from .certificate import (
     verify_stack_division_free,
 )
 from .errors import (
+    CheckpointMismatchError,
     KillSwitchEngagedError,
     LatticeFlushError,
     StateFlushError,
@@ -81,7 +82,9 @@ class WarpModeld:
         canary_runner_override: Any | None = None,
         pinned_zone_manifest_id: str | None = None,
         pinned_zone_manifest: Mapping[str, Any] | None = None,
+        require_adapter_file: bool = True,
     ) -> None:
+        self.require_adapter_file = require_adapter_file
         self._lock = threading.RLock()
         self.pinned_checkpoint = pinned_checkpoint
         self.pinned_lineage = pinned_lineage
@@ -389,15 +392,18 @@ class WarpModeld:
                     seen_llama_ids.add(bundle.llama_adapter_id)
                     bundles.append(bundle)
                 for bundle in bundles:
-                    stage1_reports.append(
-                        verify_stage1(
-                            bundle,
-                            self.pinned_checkpoint,
-                            self.pinned_lineage,
-                            self.live_runtime_flags,
-                            pinned_zone_manifest_id=self.pinned_zone_manifest_id,
-                        )
+                    report = verify_stage1(
+                        bundle,
+                        self.pinned_checkpoint,
+                        self.pinned_lineage,
+                        self.live_runtime_flags,
+                        pinned_zone_manifest_id=self.pinned_zone_manifest_id,
                     )
+                    if self.require_adapter_file and not report.adapter_file_verified:
+                        raise CheckpointMismatchError(
+                            f"adapter {bundle.adapter_id} has no adapter_path, so its bytes were never hashed"
+                        )
+                    stage1_reports.append(report)
             except WarpError as err:
                 self._record_reject(err, adapters=[b.manifest_entry() for b in bundles])
                 raise
