@@ -215,6 +215,7 @@ class TestWeftNativeIngestion(unittest.TestCase):
 
                 signer = HmacSha256Signer(b"native-weft-test-key-32-bytes-01", key_id="warp-weft-v1")
                 modeld = WarpModeld(
+                    require_adapter_file=False,
                     pinned_checkpoint=pinned_ckpt,
                     pinned_lineage=lineage,
                     live_runtime_flags=flags,
@@ -325,6 +326,7 @@ class TestZoneManifestRotationEnforcement(unittest.TestCase):
                 ledger_path = tmp / "ledger.jsonl"
 
                 modeld = WarpModeld(
+                    require_adapter_file=False,
                     pinned_checkpoint=make_checkpoint(),
                     pinned_lineage=make_lineage(),
                     live_runtime_flags=make_runtime_flags(),

@@ -64,6 +64,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         canary_slot_id=int(cfg.get("canary_slot_id", 0)),
         pinned_zone_manifest_id=cfg.get("pinned_zone_manifest_id"),
         pinned_zone_manifest=zone_manifest_obj,
+        require_adapter_file=bool(cfg.get("require_adapter_file", True)),
     )
 
     server = WarpUnixRpcServer(

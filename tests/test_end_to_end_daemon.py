@@ -207,6 +207,7 @@ class TestEndToEndDaemon(unittest.TestCase):
                     "llama_server_url": url,
                     "require_localhost": True,
                     "canary_slot_id": 0,
+                    "require_adapter_file": False,
                     "canary_suite_path": str(CANARY_SUITE_PATH),
                     "ledger_path": str(ledger_path),
                     "ledger_key_path": str(key_file),

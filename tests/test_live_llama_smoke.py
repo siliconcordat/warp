@@ -386,6 +386,7 @@ class TestLiveLlamaSmoke(unittest.TestCase):
                 signer = HmacSha256Signer(b"live-warp-modeld-key-32-bytes-01", key_id="warp-live-v1")
                 ledger_path = tmp / "live-ledger.jsonl"
                 modeld = WarpModeld(
+                    require_adapter_file=False,
                     pinned_checkpoint=ckpt,
                     pinned_lineage=lineage,
                     live_runtime_flags=runtime_flags,
