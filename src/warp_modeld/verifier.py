@@ -5,6 +5,9 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hmac
+import os
+from pathlib import Path
+import stat
 import threading
 import time
 from typing import Any, Mapping, Sequence
@@ -17,6 +20,7 @@ from .certificate import (
     verify_stack_division_free,
 )
 from .errors import (
+    CheckpointMismatchError,
     KillSwitchEngagedError,
     LatticeFlushError,
     StateFlushError,
@@ -30,6 +34,7 @@ from .fingerprint import (
     Plane1Lineage,
     RuntimeFlags,
     Stage1Report,
+    compute_file_sha256,
     sha256_json,
     validate_zone_manifest_id,
     verify_stage1,
@@ -402,6 +407,16 @@ class WarpModeld:
                 self._record_reject(err, adapters=[b.manifest_entry() for b in bundles])
                 raise
 
+            # Stage 1b: bind every Stage-1 verified adapter_path to the exact file loaded by
+            # llama-server for that llama_adapter_id BEFORE Stage 2/3/4 can run.
+            if any(b.adapter_path is not None for b in bundles):
+                try:
+                    loaded_stage1 = self.llama_client.list_lora_adapters()
+                    self._verify_loaded_adapter_bindings(bundles, loaded_stage1)
+                except WarpError as err:
+                    self._record_reject(err, adapters=[b.manifest_entry() for b in bundles])
+                    raise
+
             # Stage 2: division-free exact integer FixedRadixCertificate gate (<1ms).
             try:
                 composed_cert = (
@@ -445,12 +460,30 @@ class WarpModeld:
             try:
                 flushed, bank_receipts = self._flush_all_slots()
                 loaded = self.llama_client.list_lora_adapters()
+                loaded_by_id = self._verify_loaded_adapter_bindings(bundles, loaded)
+                for bundle in bundles:
+                    if bundle.adapter_path is not None:
+                        loaded_path = os.path.realpath(loaded_by_id[bundle.llama_adapter_id].path)
+                        try:
+                            actual_sha = compute_file_sha256(Path(loaded_path))
+                        except OSError as exc:
+                            raise CheckpointMismatchError(
+                                f"adapter {bundle.adapter_id} file unreadable before Stage 4 activation: {exc}"
+                            ) from exc
+                        if not hmac.compare_digest(actual_sha, bundle.adapter_sha256):
+                            raise CheckpointMismatchError(
+                                f"adapter {bundle.adapter_id} file digest drifted before Stage 4 activation: "
+                                f"disk {actual_sha} != manifest {bundle.adapter_sha256}"
+                            )
                 scale_by_id = {b.llama_adapter_id: b.scale_float for b in bundles}
                 scale_payload = [
                     {"id": item.id, "scale": scale_by_id.get(item.id, 0.0)}
                     for item in loaded
                 ]
                 self.llama_client.set_lora_adapters(scale_payload)
+            except CheckpointMismatchError as err:
+                self._record_reject(err, adapters=[b.manifest_entry() for b in bundles])
+                raise
             except (LlamaClientError, StateFlushError) as exc:
                 err = exc if isinstance(exc, StateFlushError) else (
                     LatticeFlushError(f"activation failed: {exc}")
@@ -500,6 +533,66 @@ class WarpModeld:
                 receipt=receipt,
                 bank_flush_receipts=bank_receipts,
             )
+
+    @staticmethod
+    def _verify_loaded_adapter_bindings(
+        bundles: Sequence[AdapterBundle],
+        loaded: Sequence[Any],
+    ) -> dict[int, Any]:
+        """Fail closed unless llama-server loaded the exact Stage-1 verified adapter file(s)."""
+        if not isinstance(loaded, Sequence) or isinstance(loaded, (str, bytes)):
+            raise CheckpointMismatchError("llama-server returned non-sequence adapter listing")
+
+        loaded_by_id: dict[int, Any] = {}
+        for item in loaded:
+            item_id = getattr(item, "id", None)
+            if type(item_id) is not int or item_id < 0:
+                raise CheckpointMismatchError(f"invalid loaded adapter id from llama-server: {item_id!r}")
+            if item_id in loaded_by_id:
+                raise CheckpointMismatchError(f"duplicate adapter id {item_id} reported by llama-server")
+            loaded_by_id[item_id] = item
+
+        for bundle in bundles:
+            if bundle.llama_adapter_id not in loaded_by_id:
+                raise CheckpointMismatchError(
+                    f"adapter {bundle.adapter_id} (llama_adapter_id={bundle.llama_adapter_id}) "
+                    "is not loaded in llama-server"
+                )
+            if bundle.adapter_path is None:
+                continue
+
+            loaded_path = getattr(loaded_by_id[bundle.llama_adapter_id], "path", None)
+            if not isinstance(loaded_path, str) or not loaded_path.strip() or "\x00" in loaded_path:
+                raise CheckpointMismatchError(
+                    f"adapter {bundle.adapter_id} (llama_adapter_id={bundle.llama_adapter_id}) "
+                    "has missing or invalid server-reported adapter path"
+                )
+            try:
+                loaded_path.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise CheckpointMismatchError(
+                    f"adapter {bundle.adapter_id} (llama_adapter_id={bundle.llama_adapter_id}) "
+                    "has non-UTF-8 server-reported adapter path"
+                ) from exc
+
+            resolved_bundle = os.path.realpath(bundle.adapter_path)
+            resolved_server = os.path.realpath(loaded_path)
+            try:
+                bundle_stat = os.stat(resolved_bundle)
+                server_stat = os.stat(resolved_server)
+            except OSError as exc:
+                raise CheckpointMismatchError(
+                    f"adapter {bundle.adapter_id} (llama_adapter_id={bundle.llama_adapter_id}) "
+                    f"server path verification failed: {exc}"
+                ) from exc
+
+            if not stat.S_ISREG(server_stat.st_mode) or not os.path.samestat(bundle_stat, server_stat):
+                raise CheckpointMismatchError(
+                    f"adapter {bundle.adapter_id} (llama_adapter_id={bundle.llama_adapter_id}) "
+                    f"path mismatch: Stage 1 hashed {resolved_bundle!r}, llama-server loaded {resolved_server!r}"
+                )
+
+        return loaded_by_id
 
     def rollback(self, reason: str = "operator_rollback", *, engage_kill_switch: bool = False) -> RollbackResult:
         """O(1) kill-switch and explicit multi-bank (KV, SSM, horizontal lattice) state flush."""
