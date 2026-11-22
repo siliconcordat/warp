@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from pathlib import Path
+import tempfile
 import threading
 from typing import Any
 import urllib.parse
@@ -41,6 +43,11 @@ class MockLlamaState:
         *,
         has_ssm_recurrent: bool = False,
         lattice_layers: int = 0,
+        ctx_size: int = 16384,
+        build_info: str = "b11146-7fe450e19",
+        model_path: str | None = None,
+        chat_template: str | None = None,
+        extra_props: dict[str, Any] | None = None,
     ) -> None:
         self.lock = threading.RLock()
         default_adapters = [
@@ -54,6 +61,11 @@ class MockLlamaState:
         }
         self.has_ssm_recurrent = bool(has_ssm_recurrent)
         self.lattice_layers = int(lattice_layers)
+        self.ctx_size = int(ctx_size)
+        self.build_info = str(build_info)
+        self.model_path = model_path
+        self.chat_template = chat_template
+        self.extra_props: dict[str, Any] = dict(extra_props) if extra_props is not None else {}
         self.slots: dict[int, MockSlotState] = {i: MockSlotState(id=i) for i in range(num_slots)}
         self.request_log: list[dict[str, Any]] = []
         self.erased_slots: list[int] = []
@@ -145,18 +157,41 @@ class MockLlamaServer:
         *,
         has_ssm_recurrent: bool = False,
         lattice_layers: int = 0,
+        ctx_size: int = 16384,
+        build_info: str = "b11146-7fe450e19",
+        model_path: str | None = None,
+        model_bytes: bytes | None = None,
+        chat_template: str | None = None,
+        extra_props: dict[str, Any] | None = None,
     ) -> None:
         self.state = MockLlamaState(
             adapters=adapters,
             num_slots=num_slots,
             has_ssm_recurrent=has_ssm_recurrent,
             lattice_layers=lattice_layers,
+            ctx_size=ctx_size,
+            build_info=build_info,
+            model_path=model_path,
+            chat_template=chat_template,
+            extra_props=extra_props,
         )
+        if model_bytes is not None:
+            self._default_model_bytes = model_bytes
+        elif lattice_layers > 0:
+            self._default_model_bytes = b"weights-lattice-gdn"
+        else:
+            self._default_model_bytes = b"weights-qwen3-8b-q4km"
+        self._model_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self.base_url: str = ""
 
     def start(self) -> str:
+        if self.state.model_path is None:
+            self._model_tmpdir = tempfile.TemporaryDirectory(prefix="warp_mock_base_")
+            model_file = Path(self._model_tmpdir.name) / "base-model.gguf"
+            model_file.write_bytes(self._default_model_bytes)
+            self.state.model_path = str(model_file)
         state = self.state
 
         class Handler(BaseHTTPRequestHandler):
@@ -183,6 +218,19 @@ class MockLlamaServer:
                     state.request_log.append({"method": "GET", "path": self.path})
                     if parsed.path == "/health":
                         self._send_json(200, {"status": "ok"})
+                        return
+                    if parsed.path == "/props":
+                        props: dict[str, Any] = {
+                            "default_generation_settings": {"n_ctx": state.ctx_size},
+                            "total_slots": len(state.slots),
+                            "model_path": state.model_path,
+                            "build_info": state.build_info,
+                        }
+                        if state.chat_template is not None:
+                            props["chat_template"] = state.chat_template
+                        if state.extra_props:
+                            props.update(state.extra_props)
+                        self._send_json(200, props)
                         return
                     if parsed.path == "/lora-adapters":
                         out = [dict(state.adapters[k]) for k in sorted(state.adapters)]
@@ -387,3 +435,6 @@ class MockLlamaServer:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        if self._model_tmpdir is not None:
+            self._model_tmpdir.cleanup()
+            self._model_tmpdir = None
