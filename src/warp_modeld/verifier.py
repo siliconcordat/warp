@@ -35,6 +35,7 @@ from .fingerprint import (
     verify_stage1,
     verify_zone_manifest_dict,
 )
+from .gguf_lora_cert import verify_adapter_file_against_certificate
 from .ledger import LedgerReceipt, SignedLedger
 from .llama_client import LlamaClientError, LlamaServerClient
 from .state_banks import BankFlushReceipt, STATE_BANK_KV, STATE_BANK_LATTICE, STATE_BANK_SSM
@@ -420,6 +421,13 @@ class WarpModeld:
                     expected_base_weights_sha256=self.pinned_checkpoint.weights_sha256,
                     composed_certificate=composed_cert,
                 )
+                for b in bundles:
+                    if b.adapter_path is not None:
+                        verify_adapter_file_against_certificate(
+                            b.adapter_path,
+                            b.certificate,
+                            expected_adapter_sha256=b.adapter_sha256,
+                        )
             except WarpError as err:
                 self._record_reject(err, adapters=[b.manifest_entry() for b in bundles])
                 raise
