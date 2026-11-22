@@ -8,9 +8,9 @@ To run the binary flag probe against an installed `llama-server`:
     WARP_LIVE_LLAMA_TEST=1 PYTHONPATH=src python3 -B -W error -m unittest tests/test_live_llama_smoke.py -v
 
 To run the FULL live Stage 1 to Stage 4 `warp-modeld` lifecycle against a real
-`llama-server` C++ binary and a real `weft`-compiled F16 GGUF v3 LoRA:
-    WARP_LIVE_LLAMA_TEST=1 WARP_LIVE_BASE_GGUF=/path/to/model.gguf WEFT_SRC=/path/to/weft/src \
-        PYTHONPATH=src python3 -B -W error -m unittest tests/test_live_llama_smoke.py -v
+`llama-server` C++ binary and a real F16 GGUF v3 LoRA (zero third-party deps):
+    WARP_LIVE_LLAMA_TEST=1 WARP_LIVE_BASE_GGUF=/path/to/model.gguf \
+        PYTHONPATH=src:. python3 -B -W error -m unittest tests/test_live_llama_smoke.py -v
 """
 
 from __future__ import annotations
@@ -22,12 +22,17 @@ from pathlib import Path
 import shutil
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
 import urllib.request
 
+from tests.live_gguf_stdlib import (
+    build_deterministic_f16_lora_and_cert,
+    build_llama_server_lora_flags_stdlib,
+    read_gguf_model_geometry,
+    write_gguf_lora_stdlib,
+)
 from warp_modeld.canary import CanarySuite
 from warp_modeld.certificate import CertificateBounds, FixedRadixCertificate, RationalBound
 from warp_modeld.fingerprint import (
@@ -86,7 +91,6 @@ def _live_full_stack_enabled() -> bool:
     return (
         os.environ.get("WARP_LIVE_LLAMA_TEST") == "1"
         and bool(os.environ.get("WARP_LIVE_BASE_GGUF", "").strip())
-        and bool(os.environ.get("WEFT_SRC", "").strip())
     )
 
 
@@ -128,62 +132,33 @@ class TestLiveLlamaSmoke(unittest.TestCase):
 
     @unittest.skipUnless(
         _live_full_stack_enabled(),
-        "Opt-in live real-GGUF test: set WARP_LIVE_LLAMA_TEST=1, WARP_LIVE_BASE_GGUF, and WEFT_SRC",
+        "Opt-in live real-GGUF test: set WARP_LIVE_LLAMA_TEST=1 and WARP_LIVE_BASE_GGUF",
     )
     def test_live_full_stage1_to_stage4_real_llama_server_and_weft_lora(self) -> None:
         base_gguf = Path(os.environ["WARP_LIVE_BASE_GGUF"]).expanduser().resolve()
-        weft_src = Path(os.environ["WEFT_SRC"]).expanduser().resolve()
         llama_bin = os.environ.get("WARP_LLAMA_BIN") or shutil.which("llama-server")
         self.assertTrue(base_gguf.is_file(), f"base GGUF not found: {base_gguf.name}")
-        self.assertTrue(weft_src.is_dir(), "WEFT_SRC directory not found")
-        self.assertIsNotNone(llama_bin, "llama-server binary not found on PATH or WARP_LLAMA_BIN")
-        assert llama_bin is not None
+        if llama_bin is None:
+            self.fail("llama-server binary not found on PATH or WARP_LLAMA_BIN")
 
-        if str(weft_src) not in sys.path:
-            sys.path.insert(0, str(weft_src))
-
-        import numpy as np  # type: ignore[import-not-found]
-        from weft.certificate import GatePolicy  # type: ignore[import-not-found]
-        from weft.compiler import BetaEditConfig, BetaEditNullspaceProjector  # type: ignore[import-not-found]
-        from weft.gguf_lora import (  # type: ignore[import-not-found]
-            build_llama_server_lora_flags,
-            read_gguf_model_geometry,
-            write_gguf_lora,
-        )
-
-        # 1. Inspect real base GGUF geometry read-only and compile a real weft F16 GGUF v3 LoRA.
+        # 1. Inspect real base GGUF geometry read-only and compile a real F16 GGUF v3 LoRA using pure stdlib.
         geom = read_gguf_model_geometry(base_gguf)
         arch = str(geom["architecture"])
         last_blk = max(0, int(geom["block_count"]) - 1)
         target_tensor = f"blk.{last_blk}.ffn_up.weight"
         if target_tensor not in geom["tensors"]:
             target_tensor = f"blk.{last_blk}.ffn_down.weight"
-        d_out, d_in = geom["tensors"][target_tensor]["numpy_shape"]
+        d_out, d_in = geom["tensors"][target_tensor]["shape"]
 
         rank = 4
-        rng = np.random.default_rng(20261119)
-        w0_zero = np.zeros((d_out, d_in), dtype=np.float64)
-        k0 = rng.standard_normal((d_in, 16))
-        keys = rng.standard_normal((d_in, rank))
-        residuals = rng.standard_normal((d_out, rank)) * 0.25
-
-        cfg = BetaEditConfig(
-            d_in=d_in,
+        factor_b, factor_a, weft_cert_dict, weft_cert_sha = build_deterministic_f16_lora_and_cert(
             d_out=d_out,
-            max_rank=rank,
-            max_slots=4,
-            lambda_leakage=500.0,
-            lambda_ridge=1.0,
-            nullspace_threshold=1e-6,
-            threshold_mode="absolute",
-            quant_dtype="f16",
+            d_in=d_in,
+            rank=rank,
+            seed=20261119,
+            radix_scale_exp2=24,
+            projector_epoch=0,
         )
-        projector = BetaEditNullspaceProjector(w0_zero, cfg)
-        projector.initialize_anchor_covariance(k0)
-        patch = projector.stage_edit(keys, residuals, is_residual=True, rank=rank, slot_name="mde:corpus")
-        weft_policy = GatePolicy(max_frob_sq_num=50, max_frob_sq_den=1, max_leakage_num=1, max_leakage_den=1)
-        cert_ok, cert_problems = patch.certificate.verify_division_free(weft_policy)
-        self.assertTrue(cert_ok, f"weft certificate failed: {cert_problems}")
 
         with tempfile.TemporaryDirectory(prefix="warp_live_llama_") as td:
             tmp = Path(td)
@@ -192,24 +167,24 @@ class TestLiveLlamaSmoke(unittest.TestCase):
             lora_path = tmp / "corpus-f16.gguf"
             lora_rebuild = tmp / "corpus-f16-rebuild.gguf"
 
-            lora_written_path, lora_sha = write_gguf_lora(
+            lora_written_path, lora_sha = write_gguf_lora_stdlib(
                 lora_path,
                 architecture=arch,
                 lora_alpha=float(rank),
-                layer_factors={target_tensor: (patch.factor_b, patch.factor_a)},
+                layer_factors={target_tensor: (factor_b, factor_a)},
                 extra_metadata={
                     "weft.slot": "mde:corpus",
-                    "weft.certificate_sha256": patch.certificate.sha256(),
+                    "weft.certificate_sha256": weft_cert_sha,
                 },
             )
-            _, lora_rebuild_sha = write_gguf_lora(
+            _, lora_rebuild_sha = write_gguf_lora_stdlib(
                 lora_rebuild,
                 architecture=arch,
                 lora_alpha=float(rank),
-                layer_factors={target_tensor: (patch.factor_b, patch.factor_a)},
+                layer_factors={target_tensor: (factor_b, factor_a)},
                 extra_metadata={
                     "weft.slot": "mde:corpus",
-                    "weft.certificate_sha256": patch.certificate.sha256(),
+                    "weft.certificate_sha256": weft_cert_sha,
                 },
             )
             self.assertEqual(lora_sha, lora_rebuild_sha)
@@ -218,7 +193,7 @@ class TestLiveLlamaSmoke(unittest.TestCase):
             # 2. Launch real llama-server with fail-closed zero-init + slot erase enabled.
             port = _pick_free_port()
             base_url = f"http://127.0.0.1:{port}"
-            lora_flags = build_llama_server_lora_flags([lora_path], slot_save_path=slot_dir)
+            lora_flags = build_llama_server_lora_flags_stdlib([lora_path], slot_save_path=slot_dir)
             cmd = [
                 llama_bin,
                 "--model",
@@ -321,7 +296,7 @@ class TestLiveLlamaSmoke(unittest.TestCase):
                         "architecture": arch,
                         "block_count": geom["block_count"],
                         "target_tensor": target_tensor,
-                        "shape": list(geom["tensors"][target_tensor]["numpy_shape"]),
+                        "shape": list(geom["tensors"][target_tensor]["shape"]),
                     }
                 )
                 ckpt = CheckpointFingerprint(
@@ -347,13 +322,12 @@ class TestLiveLlamaSmoke(unittest.TestCase):
                     swa_checkpoints=0,
                     lora_init_without_apply=True,
                 )
-                weft_cert_dict = json.loads(patch.certificate.canonical_json())
                 warp_cert = FixedRadixCertificate.from_weft_dict(
                     weft_cert_dict,
                     adapter_id="mde:corpus",
                     adapter_sha256=lora_sha,
                     base_weights_sha256=base_weights_sha,
-                    expected_weft_sha256=patch.certificate.sha256(),
+                    expected_weft_sha256=weft_cert_sha,
                 )
                 bundle = AdapterBundle(
                     adapter_id="mde:corpus",
