@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import struct
 import tempfile
 import unittest
 
@@ -190,7 +191,30 @@ class TestWeftNativeIngestion(unittest.TestCase):
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
                 gguf_file = tmp / "corpus-f16.gguf"
-                gguf_bytes = b"GGUF\x03\x00\x00\x00mock-weft-f16-lora"
+                # Minimal valid GGUF v3 F16 LoRA (rank=2, alpha=2.0, B=0.5*I_2, A=I_2 -> frob^2=0.5<=1.0, spec^2=0.25<=0.25).
+                def _pstr(s: str) -> bytes:
+                    raw = s.encode("utf-8")
+                    return struct.pack("<Q", len(raw)) + raw
+
+                kv_items = [
+                    ("adapter.lora.alpha", 6, struct.pack("<f", 2.0)),
+                    ("adapter.type", 8, _pstr("lora")),
+                    ("general.alignment", 4, struct.pack("<I", 32)),
+                    ("general.architecture", 8, _pstr("qwen2")),
+                    ("general.type", 8, _pstr("adapter")),
+                ]
+                a_raw = struct.pack("<4e", 1.0, 0.0, 0.0, 1.0)
+                b_raw = struct.pack("<4e", 0.5, 0.0, 0.0, 0.5)
+                hdr = b"".join(
+                    [
+                        struct.pack("<4sIQQ", b"GGUF", 3, 2, len(kv_items)),
+                        *(_pstr(k) + struct.pack("<I", vt) + vb for k, vt, vb in kv_items),
+                        _pstr("blk.0.attn_q.weight.lora_a") + struct.pack("<IQQIQ", 2, 2, 2, 1, 0),
+                        _pstr("blk.0.attn_q.weight.lora_b") + struct.pack("<IQQIQ", 2, 2, 2, 1, 32),
+                    ]
+                )
+                pad_hdr = (-len(hdr)) % 32
+                gguf_bytes = hdr + b"\x00" * pad_hdr + a_raw + b"\x00" * (32 - len(a_raw)) + b_raw
                 gguf_file.write_bytes(gguf_bytes)
                 gguf_sha = hashlib.sha256(gguf_bytes).hexdigest()
                 mock.state.adapters[0]["path"] = str(gguf_file)

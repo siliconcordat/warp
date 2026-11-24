@@ -769,10 +769,16 @@ def verify_stage1(
     # Optional on-disk adapter GGUF integrity verification
     adapter_file_verified = False
     if bundle.adapter_path is not None:
-        path = Path(bundle.adapter_path)
-        if not path.is_file():
-            raise CheckpointMismatchError(f"adapter file missing on disk: {bundle.adapter_path}")
-        actual_sha = compute_file_sha256(path)
+        if not isinstance(bundle.adapter_path, str) or not bundle.adapter_path.strip() or "\x00" in bundle.adapter_path:
+            raise CheckpointMismatchError("adapter_path must be a non-empty string without NUL bytes")
+        try:
+            bundle.adapter_path.encode("utf-8")
+            path = Path(bundle.adapter_path)
+            if not path.is_file():
+                raise CheckpointMismatchError(f"adapter file missing on disk: {bundle.adapter_path}")
+            actual_sha = compute_file_sha256(path)
+        except (OSError, UnicodeEncodeError, ValueError) as exc:
+            raise CheckpointMismatchError(f"adapter file unreadable on disk: {exc}") from exc
         if not hmac.compare_digest(actual_sha, bundle.adapter_sha256):
             raise CheckpointMismatchError(
                 f"adapter {bundle.adapter_id} file digest mismatch: disk {actual_sha} != manifest {bundle.adapter_sha256}"

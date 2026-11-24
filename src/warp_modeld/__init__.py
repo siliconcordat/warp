@@ -36,6 +36,11 @@ from .fingerprint import (
     verify_stage1,
     verify_zone_manifest_dict,
 )
+from .gguf_lora_cert import (
+    AdapterFileCertificateReport,
+    verify_adapter_bytes_against_certificate,
+    verify_adapter_file_against_certificate,
+)
 from .ledger import HmacSha256Signer, LedgerReceipt, LedgerVerifier, SignedLedger, repair_ledger
 from .llama_client import (
     REQUIRED_LLAMA_SERVER_FLAGS,
@@ -62,6 +67,7 @@ from .verifier import MountResult, RollbackResult, WarpModeld
 __all__ = [
     "ALL_STATE_BANKS",
     "AdapterBundle",
+    "AdapterFileCertificateReport",
     "BankFlushReceipt",
     "CanaryConfigError",
     "CanaryFailedError",
@@ -115,6 +121,8 @@ __all__ = [
     "reject_adapter_supplied_canaries",
     "repair_ledger",
     "validate_zone_manifest_id",
+    "verify_adapter_bytes_against_certificate",
+    "verify_adapter_file_against_certificate",
     "verify_division_free",
     "verify_live_server_attestation",
     "verify_stack_division_free",
