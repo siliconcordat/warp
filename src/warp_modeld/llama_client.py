@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
 import shutil
 import subprocess
 from typing import Any, Sequence
@@ -176,14 +177,37 @@ class LlamaServerClient:
         if not isinstance(res, list):
             raise LlamaClientError("unexpected /lora-adapters payload from llama-server")
         adapters: list[LlamaAdapterInfo] = []
+        seen_ids: set[int] = set()
         for entry in res:
             if not isinstance(entry, dict) or "id" not in entry:
                 raise LlamaClientError("malformed adapter item in /lora-adapters")
+            raw_id = entry["id"]
+            if type(raw_id) is not int or raw_id < 0:
+                raise LlamaClientError(f"invalid adapter id in /lora-adapters: {raw_id!r}")
+            if raw_id in seen_ids:
+                raise LlamaClientError(f"duplicate adapter id in /lora-adapters: {raw_id}")
+            raw_path = entry.get("path")
+            if not isinstance(raw_path, str) or not raw_path.strip() or "\x00" in raw_path:
+                raise LlamaClientError(f"invalid adapter path in /lora-adapters for id {raw_id}")
+            try:
+                raw_path.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise LlamaClientError(f"invalid UTF-8 adapter path in /lora-adapters for id {raw_id}") from exc
+            raw_scale = entry.get("scale", 0.0)
+            if isinstance(raw_scale, bool) or not isinstance(raw_scale, (int, float)):
+                raise LlamaClientError(f"invalid adapter scale in /lora-adapters for id {raw_id}")
+            try:
+                scale_val = float(raw_scale)
+            except OverflowError as exc:
+                raise LlamaClientError(f"out-of-range adapter scale in /lora-adapters for id {raw_id}") from exc
+            if not math.isfinite(scale_val):
+                raise LlamaClientError(f"non-finite adapter scale in /lora-adapters for id {raw_id}")
+            seen_ids.add(raw_id)
             adapters.append(
                 LlamaAdapterInfo(
-                    id=int(entry["id"]),
-                    path=str(entry.get("path", "")),
-                    scale=float(entry.get("scale", 0.0)),
+                    id=raw_id,
+                    path=raw_path,
+                    scale=scale_val,
                 )
             )
         return adapters

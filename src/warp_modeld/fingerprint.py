@@ -441,6 +441,13 @@ class AdapterBundle:
             raise CheckpointMismatchError("scale_num and scale_den must be positive integers")
         _validate_sha256(self.runtime_flags_sha256, "runtime_flags_sha256", RuntimeFlagDriftError)
         _validate_sha256(self.derivation_digest, "derivation_digest", CheckpointMismatchError)
+        if self.adapter_path is not None:
+            if not isinstance(self.adapter_path, str) or not self.adapter_path.strip() or "\x00" in self.adapter_path:
+                raise CheckpointMismatchError("adapter_path must be a non-empty path string without NUL bytes")
+            try:
+                self.adapter_path.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise CheckpointMismatchError("adapter_path must be valid UTF-8 without unpaired surrogates") from exc
         if self.zone_manifest_id is not None:
             validate_zone_manifest_id(self.zone_manifest_id)
 

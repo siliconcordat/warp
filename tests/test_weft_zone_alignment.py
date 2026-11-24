@@ -193,6 +193,7 @@ class TestWeftNativeIngestion(unittest.TestCase):
                 gguf_bytes = b"GGUF\x03\x00\x00\x00mock-weft-f16-lora"
                 gguf_file.write_bytes(gguf_bytes)
                 gguf_sha = hashlib.sha256(gguf_bytes).hexdigest()
+                mock.state.adapters[0]["path"] = str(gguf_file)
 
                 bundle = AdapterBundle.from_weft_binding(
                     weft_manifest,
