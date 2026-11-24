@@ -184,7 +184,7 @@ class TestWeftNativeIngestion(unittest.TestCase):
         lineage = make_lineage()
         flags = make_runtime_flags()
 
-        mock = MockLlamaServer()
+        mock = MockLlamaServer(model_bytes=b"weft-weights-qwen")
         url = mock.start()
         try:
             with tempfile.TemporaryDirectory() as td:

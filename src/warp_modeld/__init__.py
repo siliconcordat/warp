@@ -42,10 +42,12 @@ from .llama_client import (
     LlamaAdapterInfo,
     LlamaClientError,
     LlamaServerClient,
+    LlamaServerProps,
     LlamaSlotInfo,
     find_missing_llama_server_flags,
     probe_llama_server_binary,
 )
+from .live_probe import LiveAttestationReport, extract_build_commit, verify_live_server_attestation
 from .server import loads_strict_json
 from .state_banks import (
     ALL_STATE_BANKS,
@@ -82,7 +84,9 @@ __all__ = [
     "LlamaAdapterInfo",
     "LlamaClientError",
     "LlamaServerClient",
+    "LlamaServerProps",
     "LlamaSlotInfo",
+    "LiveAttestationReport",
     "MountResult",
     "Plane1Lineage",
     "REQUIRED_LLAMA_SERVER_FLAGS",
@@ -104,6 +108,7 @@ __all__ = [
     "WarpModeld",
     "ZoneManifestDriftError",
     "compute_zone_manifest_id",
+    "extract_build_commit",
     "find_missing_llama_server_flags",
     "loads_strict_json",
     "probe_llama_server_binary",
@@ -111,6 +116,7 @@ __all__ = [
     "repair_ledger",
     "validate_zone_manifest_id",
     "verify_division_free",
+    "verify_live_server_attestation",
     "verify_stack_division_free",
     "verify_stage1",
     "verify_zone_manifest_dict",

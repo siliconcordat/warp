@@ -37,6 +37,7 @@ from .fingerprint import (
 )
 from .ledger import LedgerReceipt, SignedLedger
 from .llama_client import LlamaClientError, LlamaServerClient
+from .live_probe import LiveAttestationReport, verify_live_server_attestation
 from .state_banks import BankFlushReceipt, STATE_BANK_KV, STATE_BANK_LATTICE, STATE_BANK_SSM
 
 
@@ -50,6 +51,7 @@ class MountResult:
     slots_flushed: tuple[int, ...]
     receipt: LedgerReceipt
     bank_flush_receipts: tuple[BankFlushReceipt, ...] = ()
+    live_attestation: LiveAttestationReport | None = None
 
 
 @dataclass(frozen=True)
@@ -424,6 +426,19 @@ class WarpModeld:
                 self._record_reject(err, adapters=[b.manifest_entry() for b in bundles])
                 raise
 
+            # Live llama-server attestation: measure /props and on-disk base model digest
+            # against daemon pins before running Stage 3 canaries or Stage 4 activation.
+            try:
+                live_props = self.llama_client.get_props()
+                live_attestation = verify_live_server_attestation(
+                    live_props,
+                    self.pinned_checkpoint,
+                    self.live_runtime_flags,
+                )
+            except WarpError as err:
+                self._record_reject(err, adapters=[b.manifest_entry() for b in bundles])
+                raise
+
             # Stage 3: shadow-load and verifier-owned deterministic canary checks.
             try:
                 currently_verified_ids = frozenset(b.llama_adapter_id for b in self._active_bundles)
@@ -488,12 +503,14 @@ class WarpModeld:
                     "zone_manifest_id": self.pinned_zone_manifest_id,
                     "required_state_banks": list(self.pinned_checkpoint.required_state_banks()),
                     "bank_flush_receipts": [r.to_dict() for r in bank_receipts],
+                    "live_attestation": live_attestation.to_dict(),
                 },
             )
             return MountResult(
                 slot_manifest_digest=manifest_digest,
                 active_adapters=tuple(b.manifest_entry() for b in bundles),
                 stage1_reports=tuple(stage1_reports),
+                live_attestation=live_attestation,
                 stage2_result=stage2_res,
                 stage3_result=stage3_res,
                 slots_flushed=flushed,

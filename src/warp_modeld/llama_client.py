@@ -86,6 +86,41 @@ class LlamaSlotInfo:
     state_banks: dict[str, StateBankStatus] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class LlamaServerProps:
+    n_ctx: int
+    model_path: str
+    build_info: str
+    total_slots: int | None = None
+    chat_template: str | None = None
+    quantization: str | None = None
+    kv_cache_type: str | None = None
+    ctx_checkpoints: int | None = None
+    swa_checkpoints: int | None = None
+
+
+def _parse_optional_props_str(res: dict[str, Any], field_name: str) -> str | None:
+    raw = res.get(field_name)
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
+        raise LlamaClientError(f"invalid {field_name} in /props")
+    try:
+        raw.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise LlamaClientError(f"invalid UTF-8 {field_name} in /props") from exc
+    return raw
+
+
+def _parse_optional_props_nonneg_int(res: dict[str, Any], field_name: str) -> int | None:
+    raw = res.get(field_name)
+    if raw is None:
+        return None
+    if type(raw) is not int or raw < 0:
+        raise LlamaClientError(f"invalid {field_name} in /props (type={type(raw).__name__})")
+    return raw
+
+
 class LlamaServerClient:
     """HTTP client targeting a local llama-server started with --lora-init-without-apply."""
 
@@ -127,7 +162,7 @@ class LlamaServerClient:
             finally:
                 exc.close()
             raise LlamaClientError(f"llama-server HTTP {exc.code} on {method} {path}: {detail}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
             raise LlamaClientError(f"llama-server request failed on {method} {path}: {exc}") from exc
 
     def health(self) -> dict[str, Any]:
@@ -305,3 +340,60 @@ class LlamaServerClient:
         if not isinstance(res, dict):
             raise LlamaClientError("unexpected /completion payload from llama-server")
         return res
+
+    def get_props(self) -> LlamaServerProps:
+        """Query read-only GET /props from llama-server and parse live server properties."""
+        res = self._request("GET", "/props")
+        if not isinstance(res, dict):
+            raise LlamaClientError("unexpected /props payload from llama-server")
+        dgs = res.get("default_generation_settings")
+        if not isinstance(dgs, dict):
+            raise LlamaClientError("malformed /props payload: missing default_generation_settings object")
+        raw_n_ctx = dgs.get("n_ctx")
+        if type(raw_n_ctx) is not int or raw_n_ctx <= 0:
+            raise LlamaClientError(f"invalid n_ctx in /props (type={type(raw_n_ctx).__name__})")
+        raw_model_path = res.get("model_path")
+        if not isinstance(raw_model_path, str) or not raw_model_path.strip() or "\x00" in raw_model_path:
+            raise LlamaClientError("invalid model_path in /props")
+        try:
+            raw_model_path.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise LlamaClientError("invalid UTF-8 model_path in /props") from exc
+        raw_build_info = res.get("build_info")
+        if not isinstance(raw_build_info, str) or not raw_build_info.strip() or "\x00" in raw_build_info:
+            raise LlamaClientError("invalid build_info in /props")
+        try:
+            raw_build_info.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise LlamaClientError("invalid UTF-8 build_info in /props") from exc
+
+        raw_slots = res.get("total_slots")
+        total_slots: int | None = None
+        if raw_slots is not None:
+            if type(raw_slots) is not int or raw_slots <= 0:
+                raise LlamaClientError(f"invalid total_slots in /props (type={type(raw_slots).__name__})")
+            total_slots = raw_slots
+
+        raw_tpl = res.get("chat_template")
+        chat_template: str | None = None
+        if raw_tpl is not None:
+            if not isinstance(raw_tpl, str):
+                raise LlamaClientError("invalid chat_template in /props")
+            try:
+                raw_tpl.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise LlamaClientError("invalid UTF-8 chat_template in /props") from exc
+            if raw_tpl:
+                chat_template = raw_tpl
+
+        return LlamaServerProps(
+            n_ctx=raw_n_ctx,
+            model_path=raw_model_path,
+            build_info=raw_build_info,
+            total_slots=total_slots,
+            chat_template=chat_template,
+            quantization=_parse_optional_props_str(res, "quantization"),
+            kv_cache_type=_parse_optional_props_str(res, "kv_cache_type"),
+            ctx_checkpoints=_parse_optional_props_nonneg_int(res, "ctx_checkpoints"),
+            swa_checkpoints=_parse_optional_props_nonneg_int(res, "swa_checkpoints"),
+        )
