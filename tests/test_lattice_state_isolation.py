@@ -154,6 +154,7 @@ class TestLatentLatticeStateIsolation(unittest.TestCase):
 
                 signer = HmacSha256Signer(b"lattice-stage1-key-32-bytes-0001", key_id="warp-lat-v1")
                 modeld = WarpModeld(
+                    require_adapter_file=False,
                     pinned_checkpoint=ckpt,
                     pinned_lineage=make_lineage(),
                     live_runtime_flags=unsafe_flags,
@@ -184,6 +185,7 @@ class TestLatentLatticeStateIsolation(unittest.TestCase):
 
                 signer = HmacSha256Signer(b"lattice-spoof-key-32-bytes-00001", key_id="warp-lat-v1")
                 modeld = WarpModeld(
+                    require_adapter_file=False,
                     pinned_checkpoint=ckpt,
                     pinned_lineage=make_lineage(),
                     live_runtime_flags=flags,
@@ -212,6 +214,7 @@ class TestLatentLatticeStateIsolation(unittest.TestCase):
                 bundle = _make_lattice_bundle(ckpt, flags)
 
                 modeld = WarpModeld(
+                    require_adapter_file=False,
                     pinned_checkpoint=ckpt,
                     pinned_lineage=make_lineage(),
                     live_runtime_flags=flags,
@@ -261,6 +264,7 @@ class TestLatentLatticeStateIsolation(unittest.TestCase):
 
                 signer = HmacSha256Signer(b"lattice-lie-test-key-32-bytes-01", key_id="warp-lat-v1")
                 modeld = WarpModeld(
+                    require_adapter_file=False,
                     pinned_checkpoint=ckpt,
                     pinned_lineage=make_lineage(),
                     live_runtime_flags=flags,
@@ -299,6 +303,7 @@ class TestLatentLatticeStateIsolation(unittest.TestCase):
                 bundle = _make_lattice_bundle(ckpt, flags, zone_manifest_id=zone_manifest["manifest_id"])
 
                 modeld = WarpModeld(
+                    require_adapter_file=False,
                     pinned_checkpoint=ckpt,
                     pinned_lineage=make_lineage(),
                     live_runtime_flags=flags,

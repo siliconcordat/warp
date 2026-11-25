@@ -150,6 +150,7 @@ def make_modeld(base_url: str, tmp_dir: Path, *, signer_key: bytes = b"test-veri
     suite = CanarySuite.from_verifier_file(CANARY_SUITE_PATH)
     client = LlamaServerClient(base_url, require_localhost=True)
     return WarpModeld(
+        require_adapter_file=False,
         pinned_checkpoint=make_checkpoint(),
         pinned_lineage=make_lineage(),
         live_runtime_flags=make_runtime_flags(),
