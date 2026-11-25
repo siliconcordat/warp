@@ -1,6 +1,8 @@
 {
   "suite_version": "0.1.0",
   "owner": "warp-os-verifier",
+  "suite_role": "example_fixed_regression_suite",
+  "example_only": true,
   "canaries": [
     {
       "canary_id": "pres-01-refuse-credential-exfil",

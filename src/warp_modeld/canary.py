@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
+import random
 import re
+import secrets
 import stat
 import subprocess
 import time
@@ -18,6 +22,52 @@ from typing import Any, Sequence
 from .errors import CanaryFailedError, ForgedCanaryError, WarpError
 from .fingerprint import AdapterBundle
 from .llama_client import LlamaClientError, LlamaServerClient
+
+CANARY_MODE_FIXED_SUITE = "fixed_suite_regression"
+CANARY_MODE_SAMPLED_POOL = "verifier_sampled_pool"
+CANARY_MODE_SEALED_EXTERNAL = "sealed_external_command"
+
+EVIDENCE_SCOPE_BY_MODE: dict[str, str] = {
+    CANARY_MODE_FIXED_SUITE: (
+        "Deterministic regression and wiring check against a fixed canary suite; "
+        "does not prove adversarial resistance against an adapter tuned to known prompts."
+    ),
+    CANARY_MODE_SAMPLED_POOL: (
+        "Per-mount randomized subset drawn from a verifier-owned canary pool; "
+        "bounds static prompt memorization only insofar as the pool stays secret from training."
+    ),
+    CANARY_MODE_SEALED_EXTERNAL: (
+        "Sealed external verifier command executed outside warp-modeld plaintext prompt custody; "
+        "strength depends on the external verifier's private pool secrecy and grading oracle."
+    ),
+}
+
+_LOWER_HEX = frozenset("0123456789abcdef")
+
+
+def _is_sha256_hex(value: Any) -> bool:
+    return type(value) is str and len(value) == 64 and all(ch in _LOWER_HEX for ch in value)
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _canonical_sha256(payload: Any) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _require_exact_int(value: Any, name: str, *, minimum: int) -> int:
+    if type(value) is not int or value < minimum:
+        raise CanaryConfigError(f"{name} must be an integer >= {minimum}")
+    return value
+
+
+def _require_positive_finite_float(value: Any, name: str) -> float:
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0.0:
+        raise CanaryConfigError(f"{name} must be a finite number > 0")
+    return float(value)
 
 FORBIDDEN_ADAPTER_CANARY_KEYS = frozenset(
     {
@@ -164,6 +214,25 @@ class CanarySuite:
     suite_sha256: str
     canaries: tuple[CanarySpec, ...]
     source_path: str
+    suite_role: str = "fixed_regression_suite"
+    example_only: bool = False
+
+    @classmethod
+    def sealed_placeholder(
+        cls,
+        suite_sha256: str,
+        *,
+        source_path: str = "sealed-external-command",
+    ) -> CanarySuite:
+        if not _is_sha256_hex(suite_sha256):
+            raise CanaryConfigError("sealed canary suite_sha256 must be a 64-char lowercase hex digest")
+        return cls(
+            suite_sha256=suite_sha256,
+            canaries=(),
+            source_path=source_path,
+            suite_role="sealed_external_suite",
+            example_only=False,
+        )
 
     @classmethod
     def from_verifier_file(
@@ -198,6 +267,13 @@ class CanarySuite:
         if not isinstance(parsed, dict) or not isinstance(parsed.get("canaries"), list):
             raise CanaryConfigError("verifier canary file must contain a 'canaries' list")
 
+        raw_role = parsed.get("suite_role", "fixed_regression_suite")
+        if type(raw_role) is not str or not raw_role.strip():
+            raise CanaryConfigError("verifier canary 'suite_role' must be a non-empty string")
+        raw_example = parsed.get("example_only", False)
+        if type(raw_example) is not bool:
+            raise CanaryConfigError("verifier canary 'example_only' must be a boolean")
+
         specs = tuple(CanarySpec.from_dict(item) for item in parsed["canaries"])
         preservation_count = sum(1 for spec in specs if spec.category == "preservation")
         if preservation_count < min_preservation:
@@ -206,7 +282,13 @@ class CanarySuite:
                 f"(found {preservation_count})"
             )
 
-        return cls(suite_sha256=actual_sha, canaries=specs, source_path=str(file_path))
+        return cls(
+            suite_sha256=actual_sha,
+            canaries=specs,
+            source_path=str(file_path),
+            suite_role=raw_role.strip(),
+            example_only=raw_example,
+        )
 
     @classmethod
     def from_jsonl_file(
@@ -341,6 +423,43 @@ class CanaryCheckOutcome:
     category: str
     passed: bool
     failures: tuple[str, ...]
+    prompt_sha256: str | None = None
+    response_sha256: str | None = None
+
+
+def _compute_transcript_sha256(
+    suite_sha256: str,
+    evidence_mode: str,
+    outcomes: Sequence[CanaryCheckOutcome],
+) -> str:
+    return _canonical_sha256(
+        {
+            "suite_sha256": suite_sha256,
+            "evidence_mode": evidence_mode,
+            "outcomes": [
+                {
+                    "canary_id": o.canary_id,
+                    "category": o.category,
+                    "passed": o.passed,
+                    "prompt_sha256": o.prompt_sha256,
+                    "response_sha256": o.response_sha256,
+                }
+                for o in outcomes
+            ],
+        }
+    )
+
+
+def _make_outcome(spec: CanarySpec, response_text: str) -> CanaryCheckOutcome:
+    failures = tuple(spec.evaluate(response_text))
+    return CanaryCheckOutcome(
+        canary_id=spec.canary_id,
+        category=spec.category,
+        passed=(len(failures) == 0),
+        failures=failures,
+        prompt_sha256=_canonical_sha256({"system_prompt": spec.system_prompt, "prompt": spec.prompt}),
+        response_sha256=_sha256_text(response_text),
+    )
 
 
 @dataclass(frozen=True)
@@ -351,6 +470,132 @@ class CanaryResult:
     preservation_total: int
     canary_slot_flushed: bool
     elapsed_ms: float = 0.0
+    evidence_mode: str = CANARY_MODE_FIXED_SUITE
+    evidence_scope: str = EVIDENCE_SCOPE_BY_MODE[CANARY_MODE_FIXED_SUITE]
+    pool_total: int | None = None
+    sampled_per_mount: bool = False
+    example_suite_used: bool = False
+    transcript_sha256: str | None = None
+
+    def attestation_dict(self) -> dict[str, Any]:
+        pool_size = self.pool_total if self.pool_total is not None else len(self.outcomes)
+        transcript = (
+            self.transcript_sha256
+            if self.transcript_sha256 is not None
+            else _compute_transcript_sha256(self.suite_sha256, self.evidence_mode, self.outcomes)
+        )
+        return {
+            "schema_version": "warp.canary_attestation/v1",
+            "evidence_mode": self.evidence_mode,
+            "evidence_scope": self.evidence_scope,
+            "suite_sha256": self.suite_sha256,
+            "example_suite_used": self.example_suite_used,
+            "sampled_per_mount": self.sampled_per_mount,
+            "pool_total": pool_size,
+            "canaries_passed": len(self.outcomes),
+            "preservation_passed": self.preservation_passed,
+            "preservation_total": self.preservation_total,
+            "evaluated_canary_ids": [o.canary_id for o in self.outcomes],
+            "transcript_sha256": transcript,
+        }
+
+
+def verify_canary_attestation(
+    attestation: Mapping[str, Any],
+    *,
+    expected_suite_sha256: str | None = None,
+    require_non_example: bool = False,
+    min_preservation: int = 4,
+) -> dict[str, Any]:
+    """Fail-closed verification of a signed mount receipt's canary_attestation payload."""
+    _require_exact_int(min_preservation, "min_preservation", minimum=1)
+    if expected_suite_sha256 is not None and not _is_sha256_hex(expected_suite_sha256):
+        raise CanaryConfigError("expected_suite_sha256 must be a 64-char lowercase hex digest")
+    if type(require_non_example) is not bool:
+        raise CanaryConfigError("require_non_example must be a boolean")
+    if not isinstance(attestation, Mapping):
+        raise CanaryFailedError("canary_attestation must be a JSON object")
+
+    schema_ver = attestation.get("schema_version")
+    if type(schema_ver) is not str or schema_ver != "warp.canary_attestation/v1":
+        raise CanaryFailedError("unsupported or missing canary_attestation schema_version")
+
+    mode = attestation.get("evidence_mode")
+    if type(mode) is not str or mode not in EVIDENCE_SCOPE_BY_MODE:
+        raise CanaryFailedError(f"unknown canary evidence_mode: {mode!r}")
+
+    scope = attestation.get("evidence_scope")
+    if type(scope) is not str or scope != EVIDENCE_SCOPE_BY_MODE[mode]:
+        raise CanaryFailedError("canary evidence_scope does not match declared evidence_mode")
+
+    suite_sha = attestation.get("suite_sha256")
+    if not _is_sha256_hex(suite_sha):
+        raise CanaryFailedError("canary_attestation suite_sha256 must be a 64-char lowercase hex digest")
+    if expected_suite_sha256 is not None and not hmac.compare_digest(suite_sha, expected_suite_sha256):
+        raise CanaryFailedError("canary_attestation suite_sha256 does not match expected digest")
+
+    transcript_sha = attestation.get("transcript_sha256")
+    if not _is_sha256_hex(transcript_sha):
+        raise CanaryFailedError("canary_attestation transcript_sha256 must be a 64-char lowercase hex digest")
+
+    example_used = attestation.get("example_suite_used")
+    if type(example_used) is not bool:
+        raise CanaryFailedError("canary_attestation example_suite_used must be a boolean")
+    if require_non_example and example_used:
+        raise CanaryFailedError("canary_attestation used an example-only suite when non-example evidence is required")
+
+    sampled = attestation.get("sampled_per_mount")
+    if type(sampled) is not bool:
+        raise CanaryFailedError("canary_attestation sampled_per_mount must be a boolean")
+
+    evaluated_ids = attestation.get("evaluated_canary_ids")
+    if not isinstance(evaluated_ids, list) or len(evaluated_ids) == 0:
+        raise CanaryFailedError("canary_attestation evaluated_canary_ids must be a non-empty list")
+    seen_ids: set[str] = set()
+    for cid in evaluated_ids:
+        if type(cid) is not str or not cid.strip():
+            raise CanaryFailedError("canary_attestation evaluated_canary_ids must contain non-empty strings")
+        if cid in seen_ids:
+            raise CanaryFailedError(f"duplicate canary_id in canary_attestation: {cid!r}")
+        seen_ids.add(cid)
+
+    canaries_passed = attestation.get("canaries_passed")
+    pool_total = attestation.get("pool_total")
+    pres_passed = attestation.get("preservation_passed")
+    pres_total = attestation.get("preservation_total")
+    for field_name, val in (
+        ("canaries_passed", canaries_passed),
+        ("pool_total", pool_total),
+        ("preservation_passed", pres_passed),
+        ("preservation_total", pres_total),
+    ):
+        if type(val) is not int:
+            raise CanaryFailedError(f"canary_attestation {field_name} must be an integer")
+
+    if canaries_passed != len(evaluated_ids):
+        raise CanaryFailedError("canary_attestation canaries_passed must equal len(evaluated_canary_ids)")
+    if pool_total < canaries_passed:
+        raise CanaryFailedError("canary_attestation pool_total cannot be smaller than canaries_passed")
+    if mode == CANARY_MODE_FIXED_SUITE and (sampled or pool_total != canaries_passed):
+        raise CanaryFailedError(
+            "fixed_suite_regression attestation requires sampled_per_mount=false and pool_total == canaries_passed"
+        )
+    if mode == CANARY_MODE_SAMPLED_POOL and (not sampled or pool_total <= canaries_passed):
+        raise CanaryFailedError(
+            "verifier_sampled_pool attestation requires sampled_per_mount=true and pool_total > canaries_passed"
+        )
+    if pres_total < min_preservation:
+        raise CanaryFailedError(
+            f"canary_attestation preservation_total ({pres_total}) < min_preservation ({min_preservation})"
+        )
+    if pres_total > canaries_passed:
+        raise CanaryFailedError("canary_attestation preservation_total cannot exceed canaries_passed")
+    if pres_passed != pres_total:
+        raise CanaryFailedError(
+            f"canary_attestation preservation gate incomplete ({pres_passed}/{pres_total})"
+        )
+
+    return dict(attestation)
 
 
 def _extract_chat_content(response: dict[str, Any]) -> str:
@@ -380,13 +625,92 @@ class CanaryRunner:
         seed: int = 42,
         max_tokens: int = 256,
         top_p: float = 1.0,
+        sample_preservation: int | None = None,
+        sample_per_domain: int | None = None,
+        sample_cross_adapter: int | None = None,
+        sample_rng: random.Random | None = None,
+        disallow_example_suite: bool = False,
     ) -> None:
+        if type(disallow_example_suite) is not bool:
+            raise CanaryConfigError("disallow_example_suite must be a boolean")
+        if disallow_example_suite and suite.example_only:
+            raise CanaryConfigError(
+                "refusing to run example-only canary suite when disallow_example_suite is enabled"
+            )
+        if sample_preservation is not None:
+            _require_exact_int(sample_preservation, "sample_preservation", minimum=4)
+        if sample_per_domain is not None:
+            _require_exact_int(sample_per_domain, "sample_per_domain", minimum=1)
+        if sample_cross_adapter is not None:
+            _require_exact_int(sample_cross_adapter, "sample_cross_adapter", minimum=1)
         self.llama_client = llama_client
         self.suite = suite
         self.canary_slot_id = canary_slot_id
         self.seed = seed
         self.max_tokens = max_tokens
         self.top_p = float(top_p)
+        self.sample_preservation = sample_preservation
+        self.sample_per_domain = sample_per_domain
+        self.sample_cross_adapter = sample_cross_adapter
+        self.sample_rng = sample_rng
+        self.disallow_example_suite = disallow_example_suite
+        self._sampling_enabled = (
+            sample_preservation is not None
+            or sample_per_domain is not None
+            or sample_cross_adapter is not None
+        )
+
+    def _select_canaries(self, domains: Sequence[str]) -> tuple[list[CanarySpec], int]:
+        eligible = self.suite.select_for_domains(domains)
+        pool_total = len(eligible)
+        if not self._sampling_enabled:
+            return eligible, pool_total
+
+        rng = self.sample_rng if self.sample_rng is not None else secrets.SystemRandom()
+        preservation: list[CanarySpec] = []
+        by_domain: dict[str, list[CanarySpec]] = {}
+        cross: list[CanarySpec] = []
+        for spec in eligible:
+            if spec.category == "preservation":
+                preservation.append(spec)
+            elif spec.category == "domain":
+                by_domain.setdefault(spec.domains[0], []).append(spec)
+            else:
+                cross.append(spec)
+
+        if self.sample_preservation is not None:
+            if len(preservation) < self.sample_preservation:
+                raise CanaryConfigError(
+                    f"preservation canary pool ({len(preservation)}) < sample_preservation ({self.sample_preservation})"
+                )
+            preservation = sorted(rng.sample(preservation, self.sample_preservation), key=lambda c: c.canary_id)
+
+        sampled_domain: list[CanarySpec] = []
+        for dom in sorted(by_domain):
+            dom_specs = by_domain[dom]
+            if self.sample_per_domain is not None:
+                if len(dom_specs) < self.sample_per_domain:
+                    raise CanaryConfigError(
+                        f"domain {dom!r} canary pool ({len(dom_specs)}) < sample_per_domain ({self.sample_per_domain})"
+                    )
+                dom_specs = rng.sample(dom_specs, self.sample_per_domain)
+            sampled_domain.extend(dom_specs)
+        sampled_domain.sort(key=lambda c: c.canary_id)
+
+        if self.sample_cross_adapter is not None and cross:
+            if len(cross) < self.sample_cross_adapter:
+                raise CanaryConfigError(
+                    f"cross_adapter canary pool ({len(cross)}) < sample_cross_adapter ({self.sample_cross_adapter})"
+                )
+            cross = sorted(rng.sample(cross, self.sample_cross_adapter), key=lambda c: c.canary_id)
+
+        selected = preservation + sampled_domain + cross
+        if len(selected) == pool_total:
+            raise CanaryConfigError(
+                f"canary pool sampling requires eligible pool ({pool_total}) strictly larger than "
+                f"sample size ({len(selected)})"
+            )
+        return selected, pool_total
 
     def run(
         self,
@@ -422,7 +746,7 @@ class CanaryRunner:
 
         # Ensure zero global scales are left active during shadow testing if not already mounted.
         lora_payload = [{"id": b.llama_adapter_id, "scale": b.scale_float} for b in bundles]
-        selected = self.suite.select_for_domains([b.domain for b in bundles])
+        selected, pool_total = self._select_canaries([b.domain for b in bundles])
 
         outcomes: list[CanaryCheckOutcome] = []
         preservation_total = 0
@@ -460,20 +784,12 @@ class CanaryRunner:
                         id_slot=self.canary_slot_id,
                     )
                     text = _extract_chat_content(resp)
-                    failures = tuple(spec.evaluate(text))
-                    passed = len(failures) == 0
+                    outcome = _make_outcome(spec, text)
                     if spec.category == "preservation":
                         preservation_total += 1
-                        if passed:
+                        if outcome.passed:
                             preservation_passed += 1
-                    outcomes.append(
-                        CanaryCheckOutcome(
-                            canary_id=spec.canary_id,
-                            category=spec.category,
-                            passed=passed,
-                            failures=failures,
-                        )
-                    )
+                    outcomes.append(outcome)
             else:
                 # LPT load-balanced deterministic partitioning across parallel server slots for <3s Stage 3 execution
                 buckets: dict[int, list[tuple[int, CanarySpec]]] = {sid: [] for sid in slot_ids}
@@ -512,18 +828,7 @@ class CanaryRunner:
                             id_slot=sid,
                         )
                         txt = _extract_chat_content(r)
-                        fails = tuple(spec.evaluate(txt))
-                        bucket_out.append(
-                            (
-                                orig_idx,
-                                CanaryCheckOutcome(
-                                    canary_id=spec.canary_id,
-                                    category=spec.category,
-                                    passed=(len(fails) == 0),
-                                    failures=fails,
-                                ),
-                            )
-                        )
+                        bucket_out.append((orig_idx, _make_outcome(spec, txt)))
                     return bucket_out
 
                 indexed_outcomes: list[tuple[int, CanaryCheckOutcome]] = []
@@ -574,13 +879,21 @@ class CanaryRunner:
         if not slot_flushed:
             raise CanaryFailedError("failed to flush canary slot after shadow evaluation")
 
+        evidence_mode = CANARY_MODE_SAMPLED_POOL if self._sampling_enabled else CANARY_MODE_FIXED_SUITE
+        outcomes_tuple = tuple(outcomes)
         return CanaryResult(
             suite_sha256=self.suite.suite_sha256,
-            outcomes=tuple(outcomes),
+            outcomes=outcomes_tuple,
             preservation_passed=preservation_passed,
             preservation_total=preservation_total,
             canary_slot_flushed=slot_flushed,
             elapsed_ms=elapsed_ms,
+            evidence_mode=evidence_mode,
+            evidence_scope=EVIDENCE_SCOPE_BY_MODE[evidence_mode],
+            pool_total=pool_total,
+            sampled_per_mount=self._sampling_enabled,
+            example_suite_used=self.suite.example_only,
+            transcript_sha256=_compute_transcript_sha256(self.suite.suite_sha256, evidence_mode, outcomes_tuple),
         )
 
 
@@ -601,20 +914,38 @@ class ExternalCommandCanaryRunner:
         command: Sequence[str],
         *,
         suite_sha256_hint: str | None = None,
+        expected_suite_sha256: str | None = None,
         canary_slot_id: int = 0,
         timeout_seconds: float = 30.0,
         min_preservation: int = 4,
     ) -> None:
-        if not command:
-            raise CanaryConfigError("external canary command must be non-empty")
-        if min_preservation < 1:
-            raise CanaryConfigError("min_preservation must be >= 1")
+        if isinstance(command, (str, bytes)) or not command:
+            raise CanaryConfigError("external canary command must be a non-empty sequence of strings")
+        cmd_parts: list[str] = []
+        for part in command:
+            if type(part) is not str or not part.strip():
+                raise CanaryConfigError("external canary command entries must be non-empty strings")
+            cmd_parts.append(part)
+        _require_exact_int(min_preservation, "min_preservation", minimum=1)
+        _require_exact_int(canary_slot_id, "canary_slot_id", minimum=0)
+        timeout_val = _require_positive_finite_float(timeout_seconds, "timeout_seconds")
+        if suite_sha256_hint is not None and not _is_sha256_hex(suite_sha256_hint):
+            raise CanaryConfigError("suite_sha256_hint must be a 64-char lowercase hex digest")
+        if expected_suite_sha256 is not None and not _is_sha256_hex(expected_suite_sha256):
+            raise CanaryConfigError("expected_suite_sha256 must be a 64-char lowercase hex digest")
+
         self.llama_client = llama_client
-        self.command = tuple(str(c) for c in command)
-        self.suite_sha256 = suite_sha256_hint or hashlib.sha256(" ".join(self.command).encode("utf-8")).hexdigest()
+        self.command = tuple(cmd_parts)
+        self.expected_suite_sha256 = expected_suite_sha256
+        if expected_suite_sha256 is not None:
+            self.suite_sha256 = expected_suite_sha256
+        elif suite_sha256_hint is not None:
+            self.suite_sha256 = suite_sha256_hint
+        else:
+            self.suite_sha256 = hashlib.sha256(" ".join(self.command).encode("utf-8")).hexdigest()
         self.canary_slot_id = canary_slot_id
-        self.timeout_seconds = float(timeout_seconds)
-        self.min_preservation = int(min_preservation)
+        self.timeout_seconds = timeout_val
+        self.min_preservation = min_preservation
 
     def run(
         self,
@@ -717,7 +1048,17 @@ class ExternalCommandCanaryRunner:
         if not isinstance(parsed, dict):
             raise CanaryFailedError("opaque verifier canary command output must be a JSON object")
 
-        suite_sha = str(parsed.get("suite_sha256") or parsed.get("canaries_sha256") or self.suite_sha256)
+        raw_suite_sha = parsed.get("suite_sha256")
+        if raw_suite_sha is None:
+            raw_suite_sha = parsed.get("canaries_sha256")
+        if raw_suite_sha is not None and not _is_sha256_hex(raw_suite_sha):
+            raise CanaryFailedError("opaque verifier suite_sha256 must be a 64-char lowercase hex digest")
+        if self.expected_suite_sha256 is not None and (
+            raw_suite_sha is None or not hmac.compare_digest(raw_suite_sha, self.expected_suite_sha256)
+        ):
+            raise CanaryFailedError("opaque verifier suite_sha256 missing or mismatched against pinned digest")
+        suite_sha = raw_suite_sha if raw_suite_sha is not None else self.suite_sha256
+
         raw_outcomes = parsed.get("outcomes")
         if raw_outcomes is None:
             raw_outcomes = parsed.get("results")
@@ -761,12 +1102,20 @@ class ExternalCommandCanaryRunner:
             raw_failures = item.get("failures")
             if not isinstance(raw_failures, list):
                 raw_failures = item.get("failure_codes", ())
+            prompt_sha = item.get("prompt_sha256")
+            if prompt_sha is not None and not _is_sha256_hex(prompt_sha):
+                raise CanaryFailedError(f"invalid prompt_sha256 for canary {cid!r}")
+            response_sha = item.get("response_sha256")
+            if response_sha is not None and not _is_sha256_hex(response_sha):
+                raise CanaryFailedError(f"invalid response_sha256 for canary {cid!r}")
             parsed_outcomes.append(
                 CanaryCheckOutcome(
                     canary_id=cid,
                     category=cat,
                     passed=bool(item["passed"]),
                     failures=tuple(str(f) for f in raw_failures),
+                    prompt_sha256=prompt_sha,
+                    response_sha256=response_sha,
                 )
             )
 
@@ -775,14 +1124,16 @@ class ExternalCommandCanaryRunner:
         pres_total = len(pres_items)
         pres_passed = sum(1 for o in pres_items if o.passed)
 
-        if parsed.get("preservation_total") is not None and int(parsed["preservation_total"]) != pres_total:
+        raw_pres_total = parsed.get("preservation_total")
+        if raw_pres_total is not None and (type(raw_pres_total) is not int or raw_pres_total != pres_total):
             raise CanaryFailedError(
-                f"opaque verifier preservation_total ({parsed['preservation_total']}) disagrees with "
+                f"opaque verifier preservation_total ({raw_pres_total}) disagrees with "
                 f"outcomes count ({pres_total})"
             )
-        if parsed.get("preservation_passed") is not None and int(parsed["preservation_passed"]) != pres_passed:
+        raw_pres_passed = parsed.get("preservation_passed")
+        if raw_pres_passed is not None and (type(raw_pres_passed) is not int or raw_pres_passed != pres_passed):
             raise CanaryFailedError(
-                f"opaque verifier preservation_passed ({parsed['preservation_passed']}) disagrees with "
+                f"opaque verifier preservation_passed ({raw_pres_passed}) disagrees with "
                 f"outcomes count ({pres_passed})"
             )
         if pres_total < self.min_preservation:
@@ -790,6 +1141,20 @@ class ExternalCommandCanaryRunner:
                 f"opaque verifier canary gate requires at least {self.min_preservation} preservation canaries "
                 f"(found {pres_total})"
             )
+
+        raw_sampled = parsed.get("sampled_per_mount", False)
+        if type(raw_sampled) is not bool:
+            raise CanaryFailedError("opaque verifier sampled_per_mount must be a boolean")
+        raw_pool_total = parsed.get("pool_total")
+        if raw_pool_total is None:
+            pool_total = len(outcomes)
+        elif type(raw_pool_total) is not int or raw_pool_total < len(outcomes):
+            raise CanaryFailedError("opaque verifier pool_total must be an integer >= len(outcomes)")
+        else:
+            pool_total = raw_pool_total
+        raw_transcript = parsed.get("transcript_sha256")
+        if raw_transcript is not None and not _is_sha256_hex(raw_transcript):
+            raise CanaryFailedError("opaque verifier transcript_sha256 must be a 64-char lowercase hex digest")
 
         failed = [o for o in outcomes if not o.passed]
         verdict_str = str(parsed.get("verdict") or "").strip().lower()
@@ -803,6 +1168,11 @@ class ExternalCommandCanaryRunner:
             raise CanaryFailedError(
                 f"opaque verifier canary gate failed (preservation {pres_passed}/{pres_total}, failed={len(failed)})"
             )
+        transcript_sha = (
+            raw_transcript
+            if raw_transcript is not None
+            else _compute_transcript_sha256(suite_sha, CANARY_MODE_SEALED_EXTERNAL, outcomes)
+        )
         return CanaryResult(
             suite_sha256=suite_sha,
             outcomes=outcomes,
@@ -810,4 +1180,81 @@ class ExternalCommandCanaryRunner:
             preservation_total=pres_total,
             canary_slot_flushed=True,
             elapsed_ms=elapsed_ms,
+            evidence_mode=CANARY_MODE_SEALED_EXTERNAL,
+            evidence_scope=EVIDENCE_SCOPE_BY_MODE[CANARY_MODE_SEALED_EXTERNAL],
+            pool_total=pool_total,
+            sampled_per_mount=raw_sampled,
+            example_suite_used=False,
+            transcript_sha256=transcript_sha,
         )
+
+
+def _load_canary_suite_path(path: Any, *, expected_sha256: str | None) -> CanarySuite:
+    if type(path) is not str or not path.strip():
+        raise CanaryConfigError("canary_suite_path must be a non-empty string")
+    file_path = Path(path)
+    if file_path.suffix.lower() == ".jsonl":
+        return CanarySuite.from_jsonl_file(file_path, expected_sha256=expected_sha256)
+    return CanarySuite.from_verifier_file(file_path, expected_sha256=expected_sha256)
+
+
+def build_canary_runner_from_config(
+    cfg: Mapping[str, Any],
+    llama_client: LlamaServerClient,
+) -> tuple[CanarySuite, CanaryRunner | ExternalCommandCanaryRunner]:
+    """Construct Stage 3 suite metadata and runner from a daemon JSON config mapping."""
+    if not isinstance(cfg, Mapping):
+        raise CanaryConfigError("daemon config must be a JSON object")
+
+    canary_slot_id = _require_exact_int(cfg.get("canary_slot_id", 0), "canary_slot_id", minimum=0)
+    canary_max_tokens = _require_exact_int(cfg.get("canary_max_tokens", 256), "canary_max_tokens", minimum=1)
+    expected_sha = cfg.get("canary_suite_sha256")
+    if expected_sha is not None and not _is_sha256_hex(expected_sha):
+        raise CanaryConfigError("canary_suite_sha256 must be a 64-char lowercase hex digest")
+
+    raw_cmd = cfg.get("canary_runner_command")
+    raw_path = cfg.get("canary_suite_path")
+    if raw_cmd is not None:
+        timeout_raw = cfg.get("canary_runner_timeout_seconds", 30.0)
+        min_pres_raw = cfg.get("canary_min_preservation", 4)
+        if raw_path is not None:
+            suite = _load_canary_suite_path(raw_path, expected_sha256=expected_sha)
+            runner = ExternalCommandCanaryRunner(
+                llama_client,
+                raw_cmd,
+                suite_sha256_hint=suite.suite_sha256,
+                expected_suite_sha256=expected_sha,
+                canary_slot_id=canary_slot_id,
+                timeout_seconds=timeout_raw,
+                min_preservation=min_pres_raw,
+            )
+            return suite, runner
+        if expected_sha is None:
+            raise CanaryConfigError(
+                "canary_runner_command without canary_suite_path requires pinned canary_suite_sha256"
+            )
+        runner = ExternalCommandCanaryRunner(
+            llama_client,
+            raw_cmd,
+            expected_suite_sha256=expected_sha,
+            canary_slot_id=canary_slot_id,
+            timeout_seconds=timeout_raw,
+            min_preservation=min_pres_raw,
+        )
+        return CanarySuite.sealed_placeholder(expected_sha), runner
+
+    if raw_path is None:
+        raise CanaryConfigError("config must specify either 'canary_suite_path' or 'canary_runner_command'")
+
+    suite = _load_canary_suite_path(raw_path, expected_sha256=expected_sha)
+    runner = CanaryRunner(
+        llama_client,
+        suite,
+        canary_slot_id=canary_slot_id,
+        max_tokens=canary_max_tokens,
+        sample_preservation=cfg.get("canary_sample_preservation"),
+        sample_per_domain=cfg.get("canary_sample_per_domain"),
+        sample_cross_adapter=cfg.get("canary_sample_cross_adapter"),
+        disallow_example_suite=cfg.get("disallow_example_canary_suite", False),
+    )
+    return suite, runner

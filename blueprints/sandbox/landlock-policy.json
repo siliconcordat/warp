@@ -10,7 +10,6 @@
       "/lib",
       "/lib64",
       "/etc/ssl/certs",
-      "/etc/warp/canaries",
       "/var/lib/warp/models"
     ],
     "read_write": [
@@ -21,6 +20,7 @@
       "/run/warp-modeld",
       "/var/lib/warp-ledger",
       "/etc/warp/keys",
+      "/etc/warp/canaries",
       "/var/lib/warp/snapshots",
       "/efi"
     ]

@@ -10,7 +10,7 @@ import sys
 import threading
 from typing import Sequence
 
-from .canary import CanarySuite
+from .canary import CanarySuite, build_canary_runner_from_config
 from .certificate import CertificateBounds, FixedRadixCertificate, verify_division_free
 from .errors import WarpError
 from .fingerprint import CheckpointFingerprint, Plane1Lineage, RuntimeFlags
@@ -35,10 +35,6 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     single_bounds = CertificateBounds.from_dict(cfg["single_bounds"])
     joint_bounds = CertificateBounds.from_dict(cfg["joint_bounds"])
 
-    canary_suite = CanarySuite.from_verifier_file(
-        cfg["canary_suite_path"],
-        expected_sha256=cfg.get("canary_suite_sha256"),
-    )
     key_bytes = _load_key_bytes(Path(cfg["ledger_key_path"]))
     signer = HmacSha256Signer(key_bytes, key_id=str(cfg.get("ledger_key_id", "warp-ledger-hmac-v1")))
     ledger = SignedLedger(cfg["ledger_path"], signer)
@@ -47,6 +43,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         timeout_seconds=float(cfg.get("llama_timeout_seconds", 10.0)),
         require_localhost=bool(cfg.get("require_localhost", True)),
     )
+    canary_suite, canary_runner_override = build_canary_runner_from_config(cfg, llama)
 
     zone_manifest_obj = None
     if cfg.get("zone_manifest_path"):
@@ -59,6 +56,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         single_bounds=single_bounds,
         joint_bounds=joint_bounds,
         canary_suite=canary_suite,
+        canary_runner_override=canary_runner_override,
         llama_client=llama,
         ledger=ledger,
         canary_slot_id=int(cfg.get("canary_slot_id", 0)),
