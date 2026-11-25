@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Mandatory fail-closed bubblewrap tool executor for siliconcordat/warp.
-# Enforces empty network namespace (Zone A default), read-only verifier/model mounts,
-# and zero access to warp-modeld control sockets or signing keys.
+# Enforces empty network namespace (Zone A default), read-only base model mounts,
+# and zero access to warp-modeld control sockets, signing keys, or verifier canaries.
 
 if [[ "${WARP_TOOL_EXECUTOR_REQUIRED:-1}" != "1" ]]; then
     echo "ERR_SANDBOX_POLICY: WARP_TOOL_EXECUTOR_REQUIRED must remain 1" >&2
@@ -52,10 +52,9 @@ if [[ -d /lib64 ]]; then
     BWRAP_ARGS+=(--ro-bind /lib64 /lib64)
 fi
 
-# Protected verifier suites and base weights stay strictly read-only if present.
-if [[ -d /etc/warp/canaries ]]; then
-    BWRAP_ARGS+=(--ro-bind /etc/warp/canaries /etc/warp/canaries)
-fi
+# Base weights stay strictly read-only if present.
+# Verifier canary suites (/etc/warp/canaries), signing keys (/etc/warp/keys),
+# and warp-modeld control sockets are intentionally excluded from agent tool sandboxes.
 if [[ -d /var/lib/warp/models ]]; then
     BWRAP_ARGS+=(--ro-bind /var/lib/warp/models /var/lib/warp/models)
 fi

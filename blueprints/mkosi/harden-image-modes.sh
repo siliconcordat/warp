@@ -29,8 +29,24 @@ normalize_tree() {
     find "${target}" -xdev \( -type d -o -type f \) -exec chmod go-w {} +
 }
 
+normalize_verifier_private_tree() {
+    local target="${ROOT%/}$1"
+    if [[ ! -e "${target}" && ! -L "${target}" ]]; then
+        return 0
+    fi
+    if [[ "$(id -u)" -eq 0 ]]; then
+        if getent group warp-modeld >/dev/null 2>&1; then
+            find "${target}" -xdev \( -type d -o -type f \) -exec chown root:warp-modeld {} +
+        else
+            find "${target}" -xdev \( -type d -o -type f \) -exec chown root:root {} +
+        fi
+    fi
+    find "${target}" -xdev \( -type d -o -type f \) -exec chmod go-w,o-rwx {} +
+}
+
 for ancestor in \
     /etc \
+    /etc/warp \
     /etc/profile.d \
     /var \
     /var/lib \
@@ -44,8 +60,13 @@ for ancestor in \
     normalize_ancestor "${ancestor}"
 done
 
-for tree in \
+for private_tree in \
     /etc/warp/canaries \
+    /etc/warp/keys; do
+    normalize_verifier_private_tree "${private_tree}"
+done
+
+for tree in \
     /var/lib/warp/models \
     /usr/lib/systemd/system; do
     normalize_tree "${tree}"

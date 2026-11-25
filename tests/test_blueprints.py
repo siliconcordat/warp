@@ -25,6 +25,8 @@ class TestBlueprintsAndHygiene(unittest.TestCase):
             min_preservation=4,
             reject_world_writable=False,
         )
+        self.assertEqual(suite.suite_role, "example_fixed_regression_suite")
+        self.assertTrue(suite.example_only)
         self.assertGreaterEqual(sum(1 for c in suite.canaries if c.category == "preservation"), 4)
         self.assertGreaterEqual(sum(1 for c in suite.canaries if c.category == "cross_adapter"), 2)
 
@@ -37,13 +39,22 @@ class TestBlueprintsAndHygiene(unittest.TestCase):
         self.assertEqual(landlock["default_action"], "deny")
         self.assertTrue(landlock["fail_closed_if_unsupported"])
         self.assertEqual(landlock["env_gate"], "WARP_TOOL_EXECUTOR_REQUIRED=1")
-        self.assertIn("/etc/warp/canaries", landlock["rules"]["read_only"])
+        self.assertNotIn("/etc/warp/canaries", landlock["rules"]["read_only"])
         self.assertIn("/var/lib/warp/models", landlock["rules"]["read_only"])
         self.assertIn("/run/warp-modeld", landlock["rules"]["explicit_deny"])
         self.assertIn("/var/lib/warp-ledger", landlock["rules"]["explicit_deny"])
         self.assertIn("/etc/warp/keys", landlock["rules"]["explicit_deny"])
+        self.assertIn("/etc/warp/canaries", landlock["rules"]["explicit_deny"])
         self.assertFalse(landlock["network"]["zone_a_allow_network"])
         self.assertTrue(landlock["network"]["unshare_net_default"])
+
+        sandbox_script = (REPO_ROOT / "blueprints" / "sandbox" / "warp-sandbox-exec.sh").read_text(encoding="utf-8")
+        self.assertNotIn("--ro-bind /etc/warp/canaries", sandbox_script)
+        postinst = (REPO_ROOT / "blueprints" / "mkosi" / "mkosi.postinst").read_text(encoding="utf-8")
+        self.assertIn("chown root:warp-modeld /etc/warp/canaries /etc/warp/keys", postinst)
+        self.assertIn("chmod 0750 /etc/warp/canaries /etc/warp/keys", postinst)
+        harden = (REPO_ROOT / "blueprints" / "mkosi" / "harden-image-modes.sh").read_text(encoding="utf-8")
+        self.assertIn("normalize_verifier_private_tree", harden)
 
         seccomp = json.loads(
             (REPO_ROOT / "blueprints" / "sandbox" / "seccomp-tool-filter.json").read_text(encoding="utf-8")

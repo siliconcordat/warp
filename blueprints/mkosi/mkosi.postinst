@@ -4,7 +4,8 @@ set -euo pipefail
 # Post-installation image setup for siliconcordat/warp.
 # Creates dedicated unprivileged users and read-only verifier boundaries.
 
-install -d -m 0755 /etc/warp /etc/warp/canaries /etc/warp/keys
+install -d -m 0755 /etc/warp
+install -d -m 0750 /etc/warp/canaries /etc/warp/keys
 install -d -m 0755 /var/lib/warp /var/lib/warp/models /var/lib/warp/snapshots
 install -d -m 0750 /var/lib/warp-ledger
 
@@ -18,11 +19,11 @@ for svc_user in warp-llama warp-modeld warp-egress; do
     fi
 done
 
-chown root:root /etc/warp /etc/warp/canaries /var/lib/warp/models
-chmod 0755 /etc/warp/canaries /var/lib/warp/models
+chown root:root /etc/warp /var/lib/warp/models
+chmod 0755 /var/lib/warp/models
 
-chown root:warp-modeld /etc/warp/keys
-chmod 0750 /etc/warp/keys
+chown root:warp-modeld /etc/warp/canaries /etc/warp/keys
+chmod 0750 /etc/warp/canaries /etc/warp/keys
 
 chown warp-modeld:warp-modeld /var/lib/warp-ledger
 chmod 0750 /var/lib/warp-ledger

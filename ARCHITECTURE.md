@@ -76,7 +76,9 @@ On an isolated canary slot with freshly cleared KV and recurrent state, `warp-mo
 - **Per-adapter behavioral canaries:** Deterministic checks verifying the target domain habit (such as plain prose checks, UI module rules, or formal proof syntax).
 - **Cross-adapter conflict canaries:** Prompts that mix domains when multiple adapters mount together (such as a formal proof block inside a plain prose explanation) to catch interference.
 
-Only when every canary passes does `warp-modeld` publish the active `slot_manifest_digest` and write a signed `mount` receipt.
+Only when every canary passes does `warp-modeld` publish the active `slot_manifest_digest` and write a signed `mount` receipt containing an explicit `canary_attestation` block (`warp.canary_attestation/v1`).
+That receipt states the Stage 3 evidence mode (`fixed_suite_regression`, `verifier_sampled_pool`, or `sealed_external_command`), an explicit `evidence_scope` describing what a pass does and does not show, whether an example suite was used (`example_suite_used`), the exact evaluated canary IDs, pool size, and a canonical `transcript_sha256` binding evaluated prompt and response digests without storing prompt plaintext.
+The checked-in `schemas/verifier-canaries.json` file is marked `"example_only": true` as a fixed regression and wiring suite; production deployments should supply a private verifier pool sampled per mount (`canary_sample_preservation` / `canary_sample_per_domain`) or wire an opaque `canary_runner_command` with a pinned `canary_suite_sha256` and `disallow_example_canary_suite: true`.
 
 ### Stage 4: Constant-Time Kill Switch and Multi-Bank State Flush
 
@@ -138,6 +140,6 @@ Agent tool commands and verification jobs never run directly on the host user en
 Every tool invocation passes through the mandatory executor (`WARP_TOOL_EXECUTOR_REQUIRED=1`), which refuses to run if kernel isolation is unavailable:
 
 - **Namespace isolation (`bubblewrap`):** Runs inside an unprivileged user namespace with an empty network namespace (`CLONE_NEWNET`) by default, private `/tmp`, and scrubbed environment variables.
-- **Filesystem rules (`Landlock`):** Grants read-write access only to an ephemeral `btrfs` copy-on-write worktree. Mounts protected verifier canary suites, test oracles, and base model weights strictly read-only. Denies access to `warp-modeld` control sockets, ledger files, and host credentials.
+- **Filesystem rules (`Landlock`):** Grants read-write access only to an ephemeral `btrfs` copy-on-write worktree. Mounts base model weights strictly read-only. Explicitly denies access to verifier canary suites (`/etc/warp/canaries`), `warp-modeld` control sockets, ledger files, and host credentials.
 - **Syscall filter (`seccomp`):** Applies a default-deny BPF filter allowing only the system calls needed by build and test tools.
 - **Zone A vs Zone B split:** Deterministic builds, conformance checks, and CPU `float64` adapter compilation run in Zone A (no network, pinned toolchain digest, fixed `SOURCE_DATE_EPOCH`). Live GPU inference and external API calls run in Zone B with secret scanning and per-task log size caps.
