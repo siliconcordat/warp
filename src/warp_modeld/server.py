@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import socket
@@ -15,7 +16,29 @@ from .errors import WarpError
 from .fingerprint import Plane1Lineage
 from .verifier import WarpModeld
 
+# Fail-closed JSON-RPC boundary limits enforced before dispatching to modeld/llama-server:
+# - temperature: finite JSON number in [0.0, 10.0] (strings/booleans rejected)
+# - top_p: finite JSON number in (0.0, 1.0] (strings/booleans rejected)
+# - max_tokens / n_predict: exact integer in [1, 4096] (floats/booleans/strings rejected)
+# - n_probs: exact integer in [0, 128]
+# - seed: exact non-negative int32 in [0, 2**31 - 1]; the -1 random sentinel and >= 2**31
+#   values are intentionally rejected at this determinism gateway.
 MAX_REQUEST_BYTES = 2 * 1024 * 1024  # 2 MiB hard frame ceiling
+MIN_TEMPERATURE = 0.0
+MAX_TEMPERATURE = 10.0
+MAX_TOP_P = 1.0
+MIN_MAX_TOKENS = 1
+MAX_MAX_TOKENS = 4096
+MIN_N_PREDICT = 1
+MAX_N_PREDICT = 4096
+MIN_N_PROBS = 0
+MAX_N_PROBS = 128
+MIN_SEED = 0
+MAX_SEED = (1 << 31) - 1
+
+
+class _InvalidRpcParamsError(ValueError):
+    """Raised when JSON-RPC method parameters fail strict type/finiteness/bounds validation."""
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -27,9 +50,55 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return out
 
 
+def _reject_non_standard_json_constant(token: str) -> Any:
+    raise ValueError(f"non-standard JSON constant rejected: {token!r}")
+
+
+def _parse_strict_float(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite JSON float rejected: {token!r}")
+    return value
+
+
 def loads_strict_json(raw_text: str) -> Any:
-    """Parse JSON while failing closed on duplicate object keys."""
-    return json.loads(raw_text, object_pairs_hook=_reject_duplicate_json_keys)
+    """Parse JSON while failing closed on duplicate object keys, NaN/Infinity constants, and overflowing non-finite floats."""
+    return json.loads(
+        raw_text,
+        object_pairs_hook=_reject_duplicate_json_keys,
+        parse_constant=_reject_non_standard_json_constant,
+        parse_float=_parse_strict_float,
+    )
+
+
+def _parse_bounded_float(
+    value: Any,
+    name: str,
+    *,
+    lo: float,
+    hi: float,
+    strict_lo: bool = False,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _InvalidRpcParamsError(f"{name} must be a finite number, got {type(value).__name__}")
+    try:
+        out = float(value)
+    except OverflowError as exc:
+        raise _InvalidRpcParamsError(f"{name} overflows IEEE-754 float64") from exc
+    if not math.isfinite(out):
+        raise _InvalidRpcParamsError(f"{name} must be finite, got {out!r}")
+    if (out <= lo if strict_lo else out < lo) or out > hi:
+        op = "<" if strict_lo else "<="
+        raise _InvalidRpcParamsError(f"{name} out of bounds: require {lo} {op} {name} <= {hi}, got {out!r}")
+    return out
+
+
+def _parse_bounded_int(value: Any, name: str, *, lo: int, hi: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _InvalidRpcParamsError(f"{name} must be an integer, got {type(value).__name__}")
+    if value < lo or value > hi:
+        raise _InvalidRpcParamsError(f"{name} out of bounds: require {lo} <= {name} <= {hi}, got {value!r}")
+    return value
 
 
 class _WarpRpcHandler(socketserver.StreamRequestHandler):
@@ -52,7 +121,21 @@ class _WarpRpcHandler(socketserver.StreamRequestHandler):
             self._send(response)
 
     def _send(self, payload: dict[str, Any]) -> None:
-        wire = (json.dumps(payload, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
+        try:
+            encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            safe_id = payload.get("id")
+            try:
+                json.dumps(safe_id, allow_nan=False)
+            except (TypeError, ValueError):
+                safe_id = None
+            fallback = {
+                "jsonrpc": "2.0",
+                "id": safe_id,
+                "error": {"code": -32603, "message": f"non-serializable response: {exc}"},
+            }
+            encoded = json.dumps(fallback, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        wire = (encoded + "\n").encode("utf-8")
         self.wfile.write(wire)
         self.wfile.flush()
 
@@ -111,6 +194,12 @@ class _WarpUnixStreamServer(socketserver.ThreadingUnixStreamServer):
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "error": {"code": -32602, "message": f"missing parameter: {exc}"},
+            }
+        except _InvalidRpcParamsError as exc:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32602, "message": f"invalid parameter: {exc}"},
             }
         except Exception as exc:  # pragma: no cover - defensive fail-closed boundary
             return {
@@ -208,12 +297,22 @@ class _WarpUnixStreamServer(socketserver.ThreadingUnixStreamServer):
             messages = params["messages"]
             if not isinstance(messages, list):
                 raise WarpError("messages must be a list", code="ERR_INVALID_PARAMS", stage="stage4_proxy")
+            temperature = _parse_bounded_float(
+                params.get("temperature", 0.0), "temperature", lo=MIN_TEMPERATURE, hi=MAX_TEMPERATURE
+            )
+            top_p = _parse_bounded_float(
+                params.get("top_p", 1.0), "top_p", lo=0.0, hi=MAX_TOP_P, strict_lo=True
+            )
+            seed = _parse_bounded_int(params.get("seed", 42), "seed", lo=MIN_SEED, hi=MAX_SEED)
+            max_tokens = _parse_bounded_int(
+                params.get("max_tokens", 256), "max_tokens", lo=MIN_MAX_TOKENS, hi=MAX_MAX_TOKENS
+            )
             return self.modeld.infer(
                 messages,
-                temperature=float(params.get("temperature", 0.0)),
-                top_p=float(params.get("top_p", 1.0)),
-                seed=int(params.get("seed", 42)),
-                max_tokens=int(params.get("max_tokens", 256)),
+                temperature=temperature,
+                top_p=top_p,
+                seed=seed,
+                max_tokens=max_tokens,
                 raw_params=params,
                 expected_zone_manifest_id=params.get("zone_manifest_id"),
             )
@@ -222,13 +321,26 @@ class _WarpUnixStreamServer(socketserver.ThreadingUnixStreamServer):
             prompt = params["prompt"]
             if not isinstance(prompt, str):
                 raise WarpError("prompt must be a string", code="ERR_INVALID_PARAMS", stage="stage4_proxy")
+            temperature = _parse_bounded_float(
+                params.get("temperature", 0.0), "temperature", lo=MIN_TEMPERATURE, hi=MAX_TEMPERATURE
+            )
+            top_p = _parse_bounded_float(
+                params.get("top_p", 1.0), "top_p", lo=0.0, hi=MAX_TOP_P, strict_lo=True
+            )
+            seed = _parse_bounded_int(params.get("seed", 42), "seed", lo=MIN_SEED, hi=MAX_SEED)
+            n_predict = _parse_bounded_int(
+                params.get("n_predict", 64), "n_predict", lo=MIN_N_PREDICT, hi=MAX_N_PREDICT
+            )
+            n_probs = _parse_bounded_int(
+                params.get("n_probs", 0), "n_probs", lo=MIN_N_PROBS, hi=MAX_N_PROBS
+            )
             return self.modeld.complete(
                 prompt,
-                temperature=float(params.get("temperature", 0.0)),
-                top_p=float(params.get("top_p", 1.0)),
-                seed=int(params.get("seed", 42)),
-                n_predict=int(params.get("n_predict", 64)),
-                n_probs=int(params.get("n_probs", 0)),
+                temperature=temperature,
+                top_p=top_p,
+                seed=seed,
+                n_predict=n_predict,
+                n_probs=n_probs,
                 raw_params=params,
                 expected_zone_manifest_id=params.get("zone_manifest_id"),
             )
