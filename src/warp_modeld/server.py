@@ -16,6 +16,13 @@ from .errors import WarpError
 from .fingerprint import Plane1Lineage
 from .verifier import WarpModeld
 
+# Fail-closed JSON-RPC boundary limits enforced before dispatching to modeld/llama-server:
+# - temperature: finite JSON number in [0.0, 10.0] (strings/booleans rejected)
+# - top_p: finite JSON number in (0.0, 1.0] (strings/booleans rejected)
+# - max_tokens / n_predict: exact integer in [1, 4096] (floats/booleans/strings rejected)
+# - n_probs: exact integer in [0, 128]
+# - seed: exact non-negative int32 in [0, 2**31 - 1]; the -1 random sentinel and >= 2**31
+#   values are intentionally rejected at this determinism gateway.
 MAX_REQUEST_BYTES = 2 * 1024 * 1024  # 2 MiB hard frame ceiling
 MIN_TEMPERATURE = 0.0
 MAX_TEMPERATURE = 10.0
@@ -47,12 +54,20 @@ def _reject_non_standard_json_constant(token: str) -> Any:
     raise ValueError(f"non-standard JSON constant rejected: {token!r}")
 
 
+def _parse_strict_float(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite JSON float rejected: {token!r}")
+    return value
+
+
 def loads_strict_json(raw_text: str) -> Any:
-    """Parse JSON while failing closed on duplicate object keys and NaN/Infinity constants."""
+    """Parse JSON while failing closed on duplicate object keys, NaN/Infinity constants, and overflowing non-finite floats."""
     return json.loads(
         raw_text,
         object_pairs_hook=_reject_duplicate_json_keys,
         parse_constant=_reject_non_standard_json_constant,
+        parse_float=_parse_strict_float,
     )
 
 
@@ -106,7 +121,21 @@ class _WarpRpcHandler(socketserver.StreamRequestHandler):
             self._send(response)
 
     def _send(self, payload: dict[str, Any]) -> None:
-        wire = (json.dumps(payload, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("utf-8")
+        try:
+            encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            safe_id = payload.get("id")
+            try:
+                json.dumps(safe_id, allow_nan=False)
+            except (TypeError, ValueError):
+                safe_id = None
+            fallback = {
+                "jsonrpc": "2.0",
+                "id": safe_id,
+                "error": {"code": -32603, "message": f"non-serializable response: {exc}"},
+            }
+            encoded = json.dumps(fallback, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        wire = (encoded + "\n").encode("utf-8")
         self.wfile.write(wire)
         self.wfile.flush()
 
