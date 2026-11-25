@@ -69,6 +69,7 @@ WARP_LIVE_LLAMA_TEST=1 WARP_LIVE_BASE_GGUF=<model.gguf> WEFT_SRC=<weft/src> PYTH
 ## Documents
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) explains the zero-trust inference boundary, the four verification stages, the three-machine layout, and recovery rules.
+- [docs/contextual-compute.md](docs/contextual-compute.md) is a proposed note on what the OS owns when a closed pathway is not mounted.
 - [PLAN.md](PLAN.md) lists milestones, acceptance gates, and non-goals.
 
 ## License
